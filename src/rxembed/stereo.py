@@ -645,6 +645,8 @@ def assign_atrop_from_3d(mol, atrop_centers, *, required=True):
     if not atrop_centers:
         return []
     probe = Chem.Mol(mol)
+    for bond in probe.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)  # RDKit will not wedge an axis beside an E/Z slash bond
     for pair in atrop_centers:
         probe.GetBondBetweenAtoms(*pair).SetStereo(Chem.BondStereo.STEREOATROPCW)
     block = Chem.MolToMolBlock(probe, confId=probe.GetConformer().GetId(), includeStereo=True)

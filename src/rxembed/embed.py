@@ -11,6 +11,7 @@ import math
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 
 import numpy as np
 from rdkit import Chem
@@ -83,6 +84,8 @@ from .stereo import (
     axis_stereo,
     bond_stereo,
     coordination_locked_centres,
+    defined_stereo_label,
+    point_centres,
     point_stereo,
     stereo_from_3d,
 )
@@ -507,11 +510,16 @@ def _ligand_stereo_fault(site, expected, found, atoms):
     return Failure("ligand_stereo", f"{site} reads {found}, not {expected}", atoms=atoms)
 
 
-def _ligand_stereo_failure(mol, iso):
-    """Return the first ligand point, E/Z or axial mismatch on the restored public graph."""
-    wanted_points = point_stereo(iso.stereo_label)
-    wanted_ez = bond_stereo(iso.stereo_label)
-    wanted_axes = axis_stereo(iso.stereo_label)
+def stated_stereo(mol, iso):
+    """Return the stereo label conformers of `mol` must keep: `iso`'s, or an organic Mol's own tags."""
+    return defined_stereo_label(mol) if iso is None else iso.stereo_label
+
+
+def _ligand_stereo_failure(mol, label):
+    """Return the first point, E/Z or axial mismatch with stereo `label` on the restored public graph."""
+    wanted_points = point_stereo(label)
+    wanted_ez = bond_stereo(label)
+    wanted_axes = axis_stereo(label)
     if not (wanted_points or wanted_ez or wanted_axes):
         return None
     realised = stereo_from_3d(mol, exclude=metal_indices(mol))
@@ -669,7 +677,7 @@ def _seed_stereo_matches(mol, cid, iso, targets, winding_ranks, eta2_ranks, chec
                 iso, state, realised_winding
             ) != winding_signature(iso, state, winding):
                 return False
-    return not check_ligand or _ligand_stereo_failure(_restore_connected(mol, iso, cid), iso) is None
+    return not check_ligand or _ligand_stereo_failure(_restore_connected(mol, iso, cid), iso.stereo_label) is None
 
 
 def _seed_geometry_matches(mol, cid, iso):
@@ -917,6 +925,11 @@ class Conformers:
     # replacement Conformers can share one cache across every ladder rung and batch for the same isomer.
     _coord_state_prep: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
+    @cached_property
+    def _stated_stereo(self):
+        """Return the stereo label every conformer must keep (`stated_stereo`)."""
+        return stated_stereo(self._mol, self.iso)
+
     def _coordination_states(self, iso):
         """Return `iso`'s per-centre coordination-state prep, cached by `iso`'s identity."""
         if iso not in self._coord_state_prep:
@@ -1047,8 +1060,8 @@ class Conformers:
         states = self._coordination_states(self.iso)
         if reason := coordination_state_failure(self._mol, cid, self.iso, states=states):
             return reason
-        if self.iso is not None and (
-            reason := _ligand_stereo_failure(_restore_connected(self._mol, self.iso, cid), self.iso)
+        if self._stated_stereo and (
+            reason := _ligand_stereo_failure(_restore_connected(self._mol, self.iso, cid), self._stated_stereo)
         ):
             return reason
         return _structural_failure(self._mol, cid, self.cons, self.iso)
@@ -1699,6 +1712,8 @@ def _compiled(spec, fix, constrain, external, params):
             "a coordinate-free metal needs a selected coordination state; pass an Isomer from "
             "enumerate_isomers()/rx.metal(), or use the pipeline metal=<geometry> sugar"
         )
+    elif iso is None:
+        point_centres(mol)  # refuses, before DG, a stated centre the relax gate could not read back from 3D
     cons, ref = resolve_core(mol, fix=fix, constrain=constrain, has_geometry=has_geometry)
     params = EmbedParams() if params is None else params
     if iso is not None:

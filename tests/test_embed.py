@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import logging
 import re
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -558,7 +557,7 @@ def test_relax_gate_distinguishes_unassigned_ligand_stereo(monkeypatch):
     isomer = _isomer("C[C@H](F)C[NH2]->[Pt+2](<-[Cl-])(<-[Cl-])<-[Cl-]")
     monkeypatch.setattr(emb, "stereo_from_3d", lambda *_args, **_kwargs: "")
 
-    failure = emb._ligand_stereo_failure(isomer.mol, isomer)
+    failure = emb._ligand_stereo_failure(isomer.mol, isomer.stereo_label)
 
     assert failure.kind == "ligand_stereo_unassigned"
     assert Conformers(_with_geometry("CC"), [0], Constraints())._required_failure({failure: [0]}) == {
@@ -566,22 +565,25 @@ def test_relax_gate_distinguishes_unassigned_ligand_stereo(monkeypatch):
     }
 
 
-def test_relax_gate_rejects_reflected_ligand_axial_stereo():
+def test_relax_gate_rejects_reflected_organic_axial_stereo():
     mol = Chem.AddHs(Chem.MolFromSmiles("CC1=CC=CC(I)=C1N1C(C)=CC=C1Br |wU:7.7|"))
     assert rdDistGeom.EmbedMolecule(mol, randomSeed=7) == 0
-    wanted = stereo_from_3d(mol)
-    request = SimpleNamespace(stereo_label=wanted)
-    pair, expected = next(iter(axis_stereo(wanted).items()))
+    pair, expected = next(iter(axis_stereo(stereo_from_3d(mol)).items()))
     positions = mol.GetConformer().GetPositions()
     positions[:, 0] *= -1
     mol.GetConformer().SetPositions(positions)
     found = axis_stereo(stereo_from_3d(mol))[pair]
 
-    failure = emb._ligand_stereo_failure(mol, request)
+    failure = Conformers(mol, [0], Constraints())._geometry_failure(0)
     a, b = sorted(pair)
     names = f"{mol.GetAtomWithIdx(a).GetSymbol()}{a}-{mol.GetAtomWithIdx(b).GetSymbol()}{b}"
     assert str(failure) == f"axis {names} reads {found}, not {expected}"
     assert Conformers(mol, [0], Constraints())._required_failure({failure: [0]}) == {"ligand_stereo"}
+
+
+def test_embed_refuses_a_phosphine_hand_it_cannot_read_back():
+    with pytest.raises(ValueError, match=r"atom\(s\) \[1\] cannot be measured from 3D"):
+        embed(Chem.AddHs(Chem.MolFromSmiles("C[P@](CC)c1ccccc1")), n=2, seed=1)
 
 
 @pytest.mark.parametrize("raise_if_empty", [True])

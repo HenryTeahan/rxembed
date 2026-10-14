@@ -105,6 +105,21 @@ def test_stated_native_atrop_axis_is_racemized_and_measured_from_3d():
     assert after[pair] == {"M": "P", "P": "M"}[code]
 
 
+def test_atrop_axis_beside_an_imine_is_measured_from_3d():
+    embedded = Chem.AddHs(_mol(r"C/N=C1\SCCC(=O)N1c1ccccc1C(C)C |wU:8.7|"))
+    assert rdDistGeom.EmbedMolecule(embedded, randomSeed=7) == 0
+    embedded.GetBondBetweenAtoms(8, 6).SetBondDir(Chem.BondDir.NONE)  # an embedded Mol keeps the tag, not the wedge
+    before = stereo.axis_stereo(stereo.stereo_from_3d(embedded))
+    positions = embedded.GetConformer().GetPositions()
+    positions[:, 0] *= -1
+    embedded.GetConformer().SetPositions(positions)
+
+    assert stereo.axis_stereo(stereo.stereo_from_3d(embedded)) == {
+        pair: {"M": "P", "P": "M"}[code] for pair, code in before.items()
+    }
+    assert before
+
+
 # ---------------------------------------------------------------------------------------------------------
 # metal safety
 # ---------------------------------------------------------------------------------------------------------

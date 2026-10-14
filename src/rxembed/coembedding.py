@@ -4,7 +4,8 @@ A path method (NEB, a string, a TS search) needs two endpoints that each read as
 where the graphs do. Both copies are seeded, relaxed and validated as one system through the ordinary embed: each
 keeps its own compiled constraints, and `Constraints.ties` ties every atom to its copy past a budget
 (`mechanisms.Tie`). An atom's budget is its largest gap between the two graphs' seed windows to any other atom, so
-a reacting atom moves as far as its graphs require and a spectator's tie starts at `TIE_FLOOR`.
+a reacting atom moves as far as its graphs require and a spectator's tie starts at `TIE_FLOOR`; an atom that turns
+to invert a stereo element the copies state differently gets room to turn (`_tie_budgets`).
 """
 
 from __future__ import annotations
@@ -16,11 +17,19 @@ import numpy as np
 from rdkit import Chem
 
 from .bounds import resolve_params, seed_bounds, seed_count
-from .embed import Conformers, coordination_state_failure, prepare, require_seed_count, seed_conformers
-from .metal_core import VACANT, HapticSite, materialized_states, metal_indices
+from .embed import (
+    Conformers,
+    coordination_state_failure,
+    prepare,
+    require_seed_count,
+    seed_conformers,
+    stated_stereo,
+)
+from .metal_core import VACANT, HapticSite, connect_metal, materialized_states, metal_indices
 from .metal_isomer import Isomer, paired_isomer
 from .metal_polyhedron import vertex_dirs
 from .metal_stereo import chelate_links, equivalent_site_assignments, site_classes
+from .stereo import axis_stereo, point_stereo
 from .utils import combined
 
 TIE_FLOOR = 0.3  # Å: a spectator's budget, nonzero so DG is not degenerate; unmeasured
@@ -188,12 +197,47 @@ def _slot_dirs(state):
 
 
 def _tie_budgets(copies, count, params):
-    """Return each atom's budget: its largest gap between the two copies' seed windows, at least `TIE_FLOOR`."""
+    """Return each atom's budget: its largest gap between the two copies' seed windows, at least `TIE_FLOOR`.
+
+    A configuration leaves the windows alike. Where the copies state a point centre or an atropisomer axis
+    differently and its atoms keep their neighbours, the pieces that turn to invert it may also move twice their seed
+    upper bound from the element atom they turn about. Cutting the element out of the left graph leaves pieces: a
+    four-carrier centre turns its two smallest and an axis its smaller side. Inside a ring system that piece is the
+    ring system, so the copies then share little more than the element's own atoms. A lone-pair centre inverts
+    through its own plane, and an E/Z bond through windows that already differ across it, so both keep their ties.
+    Labels are CIP codes: a label changed only by new priorities also turns, and an inversion that keeps its label
+    does not.
+    """
     left, right = (seed_bounds(mol, cons, params)[:count, :count] for mol, cons, _iso, _ref in copies)
     lower = np.maximum(np.tril(left, -1), np.tril(right, -1))  # lower bounds sit below the diagonal
     upper = np.minimum(np.triu(left, 1), np.triu(right, 1)).T
     gap = np.clip(lower - upper, 0.0, None)
-    return np.maximum(TIE_FLOOR, (gap + gap.T).max(axis=1))
+    budgets = np.maximum(TIE_FLOOR, (gap + gap.T).max(axis=1))
+    reach = np.triu(left, 1) + np.triu(left, 1).T
+    graphs = [mol if iso is None else connect_metal(iso.graph, iso.donor_bonds) for mol, _cons, iso, _ref in copies]
+    labels = [stated_stereo(mol, iso) for mol, _cons, iso, _ref in copies]
+    for read in (point_stereo, axis_stereo):
+        codes = [read(label) for label in labels]
+        for element in codes[0].keys() & codes[1].keys():
+            ends = [element] if isinstance(element, int) else list(element)
+            near = [
+                [{n.GetIdx() for n in graph.GetAtomWithIdx(atom).GetNeighbors()} for atom in ends] for graph in graphs
+            ]
+            centre = len(ends) == 1
+            lone_pair = centre and len(near[0][0]) < 4  # noqa: PLR2004 - four carriers, a metal counted
+            if codes[0][element] == codes[1][element] or near[0] != near[1] or lone_pair:
+                continue
+            cut = Chem.RWMol(graphs[0])
+            for bond in (
+                graphs[0].GetAtomWithIdx(ends[0]).GetBonds() if centre else [graphs[0].GetBondBetweenAtoms(*ends)]
+            ):
+                cut.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            touched = near[0][0] if centre else set(ends)
+            pieces = sorted((list(piece) for piece in Chem.GetMolFrags(cut) if touched.intersection(piece)), key=len)
+            for piece in pieces[: 2 if centre else 1]:
+                anchor = next((atom for atom in ends if atom in piece), ends[0])
+                budgets[piece] = np.maximum(budgets[piece], 2.0 * reach[anchor, piece])
+    return budgets
 
 
 def _split(pair, copies, count):

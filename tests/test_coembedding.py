@@ -10,6 +10,7 @@ import rxembed as rx
 from rxembed import coembedding
 from rxembed.coembedding import coembed
 from rxembed.metal_isomer import Isomer
+from rxembed.stereo import defined_stereo_label, stereo_from_3d
 from rxembed.utils import without_atom_maps
 
 
@@ -92,6 +93,40 @@ def test_relabelling_keeps_each_copy_with_two_side_on_propenes_its_stereoisomer(
     for right in opposite(aqua)[:10]:
         relabelled = coembedding._least_motion(left, right)
         assert [_stereoisomer(iso) for iso in relabelled] == [_stereoisomer(left), _stereoisomer(right)]
+
+
+@pytest.mark.parametrize("smiles", ["C[C@H](O)CC", "Cc1cccc(O)c1-c1c(C)cccc1O |wU:7.6|"], ids=["centre", "axis"])
+def test_copies_that_differ_only_in_configuration_each_keep_their_own(smiles):
+    left = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    right = Chem.AddHs(Chem.MolFromSmiles(smiles.replace("@", "@@").replace("wU", "wD")))
+
+    copies = coembed(left, right, n=4, seed=1)
+
+    assert len(copies[0].ids) == 4
+    for conformers, mol in zip(copies, (left, right), strict=True):
+        for cid in conformers.ids:
+            assert stereo_from_3d(Chem.Mol(conformers.mol, confId=cid)) == defined_stereo_label(mol)
+
+
+def test_metal_copies_that_differ_only_in_a_bound_amine_hand_co_embed():
+    left, right = (
+        rx.metal(Chem.AddHs(rx.parse_smiles(f"[Pd](Cl)(Cl)(Cl)([N{tag}H](C)O)")), "SPL")[0] for tag in ("@", "@@")
+    )
+
+    assert len(coembed(left, right, n=4, seed=1)[0].ids) == 4
+
+
+def test_inverting_sn2_copies_overlay_the_spectator_carbons():
+    reactant = Chem.AddHs(Chem.MolFromSmiles("C[C@H](Br)CC.[Cl-]"))
+    product = Chem.AddHs(Chem.MolFromSmiles("C[C@@H](Cl)CC.[Br-]"))
+    product = Chem.RenumberAtoms(product, [0, 1, 5, 3, 4, 2, *range(6, product.GetNumAtoms())])
+
+    left, right = coembed(reactant, product, n=4, seed=1)
+
+    assert left.ids
+    for cid in left.ids:
+        r, p = left.mol.GetConformer(cid).GetPositions(), right.mol.GetConformer(cid).GetPositions()
+        assert np.linalg.norm(r[[0, 3, 4]] - p[[0, 3, 4]], axis=1).max() < 0.5
 
 
 def test_copies_must_share_one_atom_order():

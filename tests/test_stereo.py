@@ -105,6 +105,39 @@ def test_stated_native_atrop_axis_is_racemized_and_measured_from_3d():
     assert after[pair] == {"M": "P", "P": "M"}[code]
 
 
+@pytest.mark.parametrize(
+    "smiles",
+    ["C[P@](CC)c1ccccc1", "C[P@H]c1ccccc1", "C[As@@](CC)c1ccccc1", "C[N@]1C[C@H]1C"],
+    ids=["phosphine", "secondary-phosphine", "arsine", "aziridine"],
+)
+def test_pyramidal_hand_is_measured_from_3d(smiles):
+    embedded = Chem.AddHs(_mol(smiles))
+    assert rdDistGeom.EmbedMolecule(embedded, randomSeed=7) == 0
+    stated = stereo.defined_stereo_label(embedded)
+    read = stereo.stereo_from_3d(embedded)
+    positions = embedded.GetConformer().GetPositions()
+    positions[:, 0] *= -1
+    embedded.GetConformer().SetPositions(positions)
+
+    assert read == stated
+    assert (
+        stereo.point_stereo(stereo.stereo_from_3d(embedded))[1] == {"R": "S", "S": "R"}[stereo.point_stereo(stated)[1]]
+    )
+
+
+def test_bound_thioether_keeps_a_measurable_hand():
+    mol = parse_smiles("CC[S@](C)->[Pd+2](<-[Cl-])(<-[Cl-])<-[NH3]")
+
+    assert 2 in stereo.point_centres(mol, metal_indices(mol))
+
+
+def test_unstated_phosphine_hand_is_enumerated():
+    variants, _n_unassigned, _total, unresolved = stereo.enumerate_unassigned(_mol("CP(CC)c1ccccc1"), include="all")
+
+    assert sorted(label for _variant, label in variants) == ["P1:R", "P1:S"]
+    assert unresolved == 0
+
+
 def test_atrop_axis_beside_an_imine_is_measured_from_3d():
     embedded = Chem.AddHs(_mol(r"C/N=C1\SCCC(=O)N1c1ccccc1C(C)C |wU:8.7|"))
     assert rdDistGeom.EmbedMolecule(embedded, randomSeed=7) == 0

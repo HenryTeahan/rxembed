@@ -581,9 +581,19 @@ def test_relax_gate_rejects_reflected_organic_axial_stereo():
     assert Conformers(mol, [0], Constraints())._required_failure({failure: [0]}) == {"ligand_stereo"}
 
 
-def test_embed_refuses_a_phosphine_hand_it_cannot_read_back():
+def test_embed_keeps_a_stated_phosphine_hand():
+    conformers = embed(Chem.AddHs(Chem.MolFromSmiles("C[P@](CC)c1ccccc1")), n=2, seed=1)
+
+    assert conformers.ids
+    assert {stereo_from_3d(Chem.Mol(conformers.mol, confId=cid)) for cid in conformers.ids} == {"P1:R"}
+
+
+def test_embed_refuses_a_carbanion_hand_it_cannot_read_back():
+    mol = Chem.AddHs(Chem.MolFromSmiles("C[C-](CC)c1ccccc1"))
+    mol.GetAtomWithIdx(1).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+
     with pytest.raises(ValueError, match=r"atom\(s\) \[1\] cannot be measured from 3D"):
-        embed(Chem.AddHs(Chem.MolFromSmiles("C[P@](CC)c1ccccc1")), n=2, seed=1)
+        embed(mol, n=2, seed=1)
 
 
 @pytest.mark.parametrize("raise_if_empty", [True])

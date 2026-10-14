@@ -12,6 +12,7 @@ from rdkit.Chem.EnumerateStereoisomers import (
     EnumerateStereoisomers,
     StereoEnumerationOptions,
 )
+from rdkit.Geometry import Point3D
 
 from .metal_core import haptic_sites, ligand_graph, torsion_path
 from .utils import (
@@ -34,7 +35,7 @@ ATROP_STEREO = (Chem.BondStereo.STEREOATROPCW, Chem.BondStereo.STEREOATROPCCW)
 _ATROP_WEDGE = (Chem.BondDir.BEGINWEDGE, Chem.BondDir.BEGINDASH)
 _TETRAHEDRAL_TAGS = {Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
 _POINT_CIP = {"R", "S", "r", "s"}
-_THREE_COORDINATE_3D = {16, 34}  # RDKit's assignChiralTypesFrom3D special case: S and Se use a lone pair
+_LONE_PAIR_GROUPS = {5, 6}  # outer electrons of groups 15 and 16: a three-coordinate atom keeps a lone pair
 _RESONANCE_EZ_CAP = 32  # forms searched per fragment: independent conjugated groups multiply its form count
 _RX_EZ_PROP = re.compile(r"_rxEZ(\d+)")
 # One ligand-stereo label item each: a point centre, a double bond, an atropisomer axis.
@@ -340,15 +341,61 @@ def _point_cip_codes(mol, centers):
     return dict(result)
 
 
-def _rdkit_3d_point_capable(atom):
-    """Return whether RDKit can assign this capped atom's tetrahedral tag from 3D."""
-    degree = sum(bond.GetBondType() != Chem.BondType.ZERO for bond in atom.GetBonds())
-    total = degree + atom.GetTotalNumHs()
-    return (
-        degree >= _MIN_POINT_BRANCHES
-        and total <= 4  # noqa: PLR2004  four tetrahedral carriers
-        and (total == 4 or atom.GetAtomicNum() in _THREE_COORDINATE_3D)  # noqa: PLR2004
-    )
+def _carriers(atom):
+    """Return the atom's tetrahedral carriers in its graph: bonded neighbours and hydrogens."""
+    return sum(bond.GetBondType() != Chem.BondType.ZERO for bond in atom.GetBonds()) + atom.GetTotalNumHs()
+
+
+def _point_capable_from_3d(atom, lone_pair):
+    """Return whether this capped atom's tetrahedral tag can be read from 3D: four carriers, a `lone_pair` counted."""
+    return atom.GetDegree() >= _MIN_POINT_BRANCHES and _carriers(atom) + lone_pair == 4  # noqa: PLR2004
+
+
+def _holds_lone_pair(atom):
+    """Return whether a lone pair is this atom's fourth carrier: a group 15 or 16 atom with three, metals counted."""
+    in_group = Chem.GetPeriodicTable().GetNOuterElecs(atom.GetAtomicNum()) in _LONE_PAIR_GROUPS
+    return in_group and _carriers(atom) == 3  # noqa: PLR2004
+
+
+def _add_cap(work, atom, element, isotope, points):
+    """Bond a temporary fourth carrier to `atom`: a marked `element`, at one point per conformer; return its index.
+
+    RDKit excludes a donor-originating dative edge from tetrahedral and alkene stereo, so the cap is an ordinary
+    single-bonded neighbour on this disposable stereo graph. The isotope keeps it distinct from real substituents.
+    """
+    cap = Chem.Atom(element)
+    cap.SetNoImplicit(True)
+    cap.SetIsotope(isotope)
+    index = work.AddAtom(cap)
+    work.AddBond(atom, index, Chem.BondType.SINGLE)
+    work.GetAtomWithIdx(atom).SetNoImplicit(True)
+    for conf, point in zip(work.GetConformers(), points, strict=True):
+        conf.SetAtomPosition(index, point)
+    return index
+
+
+def _cap_lone_pairs(work, centres):
+    """Return `work` with each three-carrier centre's lone pair capped on its open side, so RDKit reads it from 3D.
+
+    The cap is a dummy atom, which CIP ranks as it ranks a lone pair. RDKit reads a three-neighbour tag with its
+    lone pair as the last neighbour, so the hand read with the cap last is the uncapped tag. A flat centre has no
+    open side: its cap sits on the centre and reads as non-tetrahedral.
+    """
+    capped = Chem.RWMol(work)
+    for idx in centres:
+        atom = capped.GetAtomWithIdx(idx)
+        if _carriers(atom) != 3:  # noqa: PLR2004  the lone pair is the fourth carrier
+            continue
+        neighbours = [n.GetIdx() for n in atom.GetNeighbors()]
+        points = []
+        for conf in capped.GetConformers():
+            pos = conf.GetPositions()
+            bonds = pos[neighbours] - pos[idx]
+            side = -(bonds / np.linalg.norm(bonds, axis=1, keepdims=True)).sum(axis=0)
+            length = np.linalg.norm(side)
+            points.append(Point3D(*(pos[idx] + (side / length if length > 1e-6 else 0.0))))  # noqa: PLR2004
+        _add_cap(capped, idx, 0, 0, points)
+    return capped.GetMol()
 
 
 def _tetrahedral_centres(mol):
@@ -502,7 +549,10 @@ def _point_capability(mol, work, cap_to_metal=(), exclude=()):
     potential -= lewis_only
     candidates = stated | potential
     supported = {
-        idx for idx in candidates if idx < work.GetNumAtoms() and _rdkit_3d_point_capable(work.GetAtomWithIdx(idx))
+        idx
+        for idx in candidates
+        if idx < work.GetNumAtoms()
+        and _point_capable_from_3d(work.GetAtomWithIdx(idx), _holds_lone_pair(mol.GetAtomWithIdx(idx)))
     }
     impossible = sorted(stated - supported)
     if impossible:
@@ -932,16 +982,10 @@ def _build_enumeration_graph(mol, exclude):
             if replacement_mirrors != removal_mirrors:
                 atom = work.GetAtomWithIdx(nb)
                 atom.SetChiralTag(mirror_tag(atom.GetChiralTag()))
-            cap = Chem.Atom(caps[nb])
-            cap.SetNoImplicit(True)
-            d = work.AddAtom(cap)
             same_element = [m for m in metal_neighbors[nb] if mol.GetAtomWithIdx(m).GetAtomicNum() == z_metal]
             isotope = 2 + z_metal + _ISOTOPE_ELEMENT_STRIDE * same_element.index(mi)
-            work.GetAtomWithIdx(d).SetIsotope(isotope)
-            # This is a disposable RDKit stereo graph, not the public chemical graph. RDKit excludes a
-            # donor-originating dative edge from tetrahedral and alkene stereo, so the cap must be a normal
-            # neighbour here. ``cap_to_metal`` retains the real bond kind for grafting and CIP charge.
-            work.AddBond(nb, d, Chem.BondType.SINGLE)
+            # The cap stands where the metal was; ``cap_to_metal`` retains the real bond kind for grafting and CIP.
+            d = _add_cap(work, nb, caps[nb], isotope, [conf.GetAtomPosition(mi) for conf in work.GetConformers()])
             for original in mol.GetAtomWithIdx(nb).GetBonds():
                 if original.GetBondType() != Chem.BondType.DOUBLE or original.GetOtherAtomIdx(nb) in exclude:
                     continue
@@ -950,10 +994,7 @@ def _build_enumeration_graph(mol, exclude):
                 if mi in original.GetStereoAtoms() and len(refs) == 2:  # noqa: PLR2004
                     copied.SetStereoAtoms(*refs)
                     copied.SetStereo(original.GetStereo())
-            work.GetAtomWithIdx(nb).SetNoImplicit(True)
             cap_to_metal[d] = (z_metal, donated, replacement_mirrors, mi)
-            for conf in work.GetConformers():
-                conf.SetAtomPosition(d, conf.GetAtomPosition(mi))
     work = work.GetMol()
     Chem.SanitizeMol(work, _STEREO_SANITIZE, catchErrors=True)
     # The strip above can orphan a C=N whose stereo reference atom was the metal, and a flagged bond with no
@@ -1329,6 +1370,7 @@ def stereo_from_3d(mol, exclude=(), *, apply=False):
     supported_points, _unsupported = _point_capability(mol, work, cap_to_metal, exclude)
     _, stated_bonds, stated_axes = _stereo_centres(work, mol.GetNumAtoms())
     inferred = set(_coordination_atrop_bonds(mol, exclude, work)) - set(stated_axes)
+    work = _cap_lone_pairs(work, supported_points)
     Chem.AssignStereochemistryFrom3D(work, confId=work.GetConformer().GetId(), replaceExistingTags=True)
     invalid = _non_tetrahedral_points(work, supported_points)
     full = Chem.Mol(mol)

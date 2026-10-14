@@ -31,7 +31,7 @@ _PT = Chem.GetPeriodicTable()
 _KEKULE_ORDERS = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
 _BRIDGE_H_FACTOR = 1.2  # x (r_cov(H) + r_cov(X)); same margin as a new-bond distance elsewhere in the pipeline
 _CONNECTIVITY = {"rdkit", "xyzgraph", "xyz2mol"}
-_BOND_ORDERS = {"xyzgraph", "xyz2mol"}
+_BOND_ORDERS = {"xyzgraph", "xyz2mol", None}
 _BRIDGEHEAD_SIGMA_MIN = 4  # a kappa2 chelate bridgehead (P, Si, B) bonds >=4 non-metal sigma neighbours
 _BRIDGEHEAD_DONORS_MIN = 2  # fewer is a sigma-silane/borane bridgehead (one metal-bound neighbour), not this rule
 _TRIGONAL_SIGMA = 3  # fewer, with no lone pair: an sp X keeps a pi orbital in the chelate plane, so the fold test fails
@@ -52,17 +52,26 @@ def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", me
     determine the split; every metal must be named. Sanitisation is lenient (rings yes, valence checks no); perceiver
     choices land on the returned Mol's ``_rxembed*`` properties; ``_rxembedChargeRescue`` says how a metal read past
     its valence electrons was read instead (`_assign_bond_orders`), empty when none was.
+
+    ``bond_orders=None`` skips only the bond-order step, for checking which bonds a geometry has: every bond stays
+    single (metal bonds dative) with no formal charge, so there is no charge to check and a radical or a zwitterion
+    reads too; ``_rxembedBondOrders`` is empty. It needs xyzgraph connectivity and never falls back, since every
+    fallback reader assigns bond orders.
     """
     if connectivity not in _CONNECTIVITY:
         raise ValueError(f"connectivity must be 'rdkit', 'xyzgraph', or 'xyz2mol', got {connectivity!r}")
     if bond_orders not in _BOND_ORDERS:
-        raise ValueError(f"bond_orders must be 'xyzgraph' or 'xyz2mol', got {bond_orders!r}")
-    if bond_orders == "xyzgraph" and connectivity != "xyzgraph":
+        raise ValueError(f"bond_orders must be 'xyzgraph', 'xyz2mol', or None, got {bond_orders!r}")
+    if bond_orders != "xyz2mol" and connectivity != "xyzgraph":
         raise ValueError(
-            "bond_orders='xyzgraph' needs connectivity='xyzgraph': that optimiser runs inside "
-            "build_graph and cannot be given another perceiver's bonds. Use bond_orders='xyz2mol'."
+            f"bond_orders={bond_orders!r} needs connectivity='xyzgraph': xyzgraph reads it inside "
+            "build_graph and cannot be given another perceiver's bonds. Use connectivity='xyzgraph', or "
+            "bond_orders='xyz2mol' to rank another perceiver's bonds."
         )
-    mol, perceived_by = _with_fallback(path, charge, connectivity, fallback)
+    if bond_orders is None:
+        mol, perceived_by = _from_xyzgraph(path, charge, quick=True), connectivity
+    else:
+        mol, perceived_by = _with_fallback(path, charge, connectivity, fallback)
     reject_boron_cages(mol)  # before xyz2mol forces multi-centre B-H/B-B into valence-two orders
     _apply_metal_charges(mol, metal_charges)  # before bond orders, so xyz2mol ranks on the named split
     mol, perceived_by, order_by = _assign_bond_orders(mol, path, charge, perceived_by, bond_orders, fallback)
@@ -72,18 +81,19 @@ def read_xyz(path, charge=0, connectivity="xyzgraph", bond_orders="xyzgraph", me
     _reject_unbonded_bridging_hydrogens(mol)
     mol = _drop_bridgehead_bonds(mol)
     _apply_metal_charges(mol, metal_charges)  # and again, so no bond-order backend overrides the named split
-    perceived_charge = Chem.GetFormalCharge(mol)
-    if perceived_charge != charge:
-        remedy = "use bond_orders='xyz2mol'" if bond_orders == "xyzgraph" else "check charge= and the input graph"
-        raise ValueError(f"perceived total charge {perceived_charge} does not match charge={charge}; {remedy}")
+    if bond_orders is not None:  # formal charges come from bond orders
+        perceived_charge = Chem.GetFormalCharge(mol)
+        if perceived_charge != charge:
+            remedy = "use bond_orders='xyz2mol'" if bond_orders == "xyzgraph" else "check charge= and the input graph"
+            raise ValueError(f"perceived total charge {perceived_charge} does not match charge={charge}; {remedy}")
+        _warn_if_charge_looks_missing(mol, charge)
     rescue = mol.GetProp("_rxembedChargeRescue") if mol.HasProp("_rxembedChargeRescue") else ""
     if rescue:
         logger.warning("read_xyz: %s", rescue)
     mol.SetProp("_rxembedConnectivity", perceived_by)
-    mol.SetProp("_rxembedBondOrders", order_by)
+    mol.SetProp("_rxembedBondOrders", order_by or "")
     mol.SetProp("_rxembedChargeRescue", rescue)
     mol.SetBoolProp("_rxembedPerceptionFallback", perceived_by != connectivity or order_by != bond_orders)
-    _warn_if_charge_looks_missing(mol, charge)
     try:
         with rdBase.BlockLogs():
             stereo_from_3d(mol, metal_indices(mol), apply=True)
@@ -122,19 +132,23 @@ def _with_fallback(path, charge, backend, allow_fallback=True):
             raise ValueError(f"{backend} {state}; {display} fallback also failed ({second}){hint}") from second
 
 
-def _from_xyzgraph(path, charge):
+def _from_xyzgraph(path, charge, quick=False):
     """Read connectivity and bond orders from xyzgraph, as a Mol with a conformer.
 
-    An edge xyzgraph marks ``NCI`` (a hydrogen bond) is a contact, not constitution, so it is left out.
+    An edge xyzgraph marks ``NCI`` (a hydrogen bond) is a contact, not constitution, so it is left out. ``quick``
+    reads connectivity alone: all-single bonds, no charges, and no ``NCI`` marks, so `_hydrogen_bond_legs` finds
+    the hydrogen bonds instead.
     """
-    import xyzgraph
+    try:
+        import xyzgraph
+    except ImportError as exc:
+        raise ImportError("xyzgraph is not installed; pip install 'rxembed[workflow]'") from exc
 
-    # Never quick=True: it skips bond-order and charge perception and returns all-single bonds.
-    graph = xyzgraph.build_graph(path, charge=charge, kekule=True)
+    graph = xyzgraph.build_graph(path, charge=charge, kekule=True, quick=quick)
     rw, idx = Chem.RWMol(), {}
     for node, data in sorted(graph.nodes(data=True)):
         atom = Chem.Atom(int(data["atomic_number"]))
-        atom.SetFormalCharge(round(data["formal_charge"]))
+        atom.SetFormalCharge(0 if quick else round(data["formal_charge"]))
         atom.SetNoImplicit(True)  # an xyz is fully explicit, hydrogens included
         idx[node] = rw.AddAtom(atom)
     for u, v, data in graph.edges(data=True):
@@ -161,6 +175,11 @@ def _from_xyzgraph(path, charge):
         x, y, z = data["position"]
         conf.SetAtomPosition(idx[node], Point3D(float(x), float(y), float(z)))
     mol.AddConformer(conf, assignId=True)
+    if quick:
+        rw = Chem.RWMol(mol)
+        for h, x in _hydrogen_bond_legs(mol):
+            remove_bond(rw, h, x)
+        mol = rw.GetMol()
     # A tolerant intermediate graph: bond-order ranking owns valence, so only this probe is silenced.
     with rdBase.BlockLogs():
         Chem.SanitizeMol(
@@ -250,8 +269,10 @@ def _assign_bond_orders(mol, path, charge, connectivity, requested, allow_fallba
     connectivity, the last resort keeps the selected graph and takes the reading with fewer radical electrons:
     xyz2mol's, with a metal's charge past its valence electrons moved onto anionic donors as radicals, or
     xyzgraph's own charges when they reach the total and keep every metal within its valence electrons. On a tie
-    xyz2mol's is taken. Return the Mol, the connectivity it now has and the backend that ordered it.
+    xyz2mol's is taken. Return the Mol, the connectivity it now has and the backend that ordered it, None for none.
     """
+    if requested is None:
+        return mol, connectivity, None
     if requested != "xyz2mol" or connectivity == "xyz2mol":
         return mol, connectivity, connectivity
     if not _has_xyz2mol_metal(mol):

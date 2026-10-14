@@ -163,6 +163,8 @@ rxembed never infers one: pass the real charge for an ion (`rx.embed`, `rx.metal
 `charge=` too), or `metal_charges={0: 2, 1: 1}` for a split the total does not fix. `read_xyz` warns when a
 metal looks like an ion read as neutral, and on every perception change, which never alters the atoms, their
 order or the charge; `fallback=False` raises instead.
+`bond_orders=None` skips only the bond-order step (single bonds, dative metal bonds, no formal charges), for
+checking which bonds a geometry has, a radical or zwitterion included.
 
 ## Reaction Endpoints
 

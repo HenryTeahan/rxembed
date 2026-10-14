@@ -424,8 +424,85 @@ def test_xyzgraph_edge_outside_the_kekule_contract_fails_instead_of_reading_sing
 
 
 def test_bond_order_perception_does_not_accept_auto_mode():
-    with pytest.raises(ValueError, match="bond_orders must be 'xyzgraph' or 'xyz2mol'"):
+    with pytest.raises(ValueError, match="bond_orders must be 'xyzgraph', 'xyz2mol', or None"):
         perceive.read_xyz("unused.xyz", bond_orders="auto")
+
+
+# rxflow's repro: a carbocation zwitterion xyzgraph orders read at -2 against charge 0.
+_CARBOCATION_ZWITTERION = """22
+
+C  -1.78367991 -0.94484834 1.62723587
+C  -1.48786183 -0.09599687 0.38534858
+C  -1.76641282 1.35270574 0.66624355
+C  -0.76900289 2.31277703 0.77096139
+O  -1.02397006 3.48581580 1.09011472
+N  0.54914200 1.92524261 0.49554493
+C  0.90716403 0.67027112 0.00933098
+C  2.20598792 0.41672488 -0.38842787
+C  2.58432749 -0.83672330 -0.93718689
+O  3.75323875 -1.06363090 -1.29364373
+C  1.56260269 -1.82343165 -1.06482359
+C  0.28191803 -1.56565409 -0.65889001
+C  -0.07334262 -0.33862089 -0.11067325
+H  -2.81087011 -0.81047613 1.96768304
+H  -1.62835513 -2.00700458 1.43724313
+H  -1.12430030 -0.65679541 2.44566418
+H  -2.16567193 -0.41111791 -0.42712050
+H  -2.77461522 1.66406787 0.86724850
+H  1.24887505 2.65229799 0.55889270
+H  2.95595030 1.17857105 -0.29813421
+H  1.83078512 -2.77636106 -1.48415299
+H  -0.47190857 -2.32781297 -0.76012566
+"""
+_NO2_DOUBLET = "3\n\nN 0.000 0.000 0.000\nO 1.194 0.000 0.000\nO -0.524 1.073 0.000\n"
+_HYDROXIDE = "2\n\nO 0.000 0.000 0.000\nH 0.970 0.000 0.000\n"
+# O-H...O at 1.40 A: xyzgraph's quick read bonds the hydrogen to both oxygens.
+_SHORT_WATER_DIMER = """6
+
+O  0.000  0.000  0.000
+H  1.000  0.000  0.000
+H -0.240  0.927  0.000
+O  2.400  0.000  0.000
+H  2.740  0.000  0.900
+H  2.740  0.000 -0.900
+"""
+
+
+def _bond_graph(mol):
+    """Return the canonical SMILES of `mol`'s bonds alone: every bond single, no charges, radicals or stereo."""
+    rw = Chem.RWMol(mol)
+    for bond in rw.GetBonds():
+        bond.SetBondType(Chem.BondType.SINGLE)
+        bond.SetIsAromatic(False)
+    for atom in rw.GetAtoms():
+        atom.SetFormalCharge(0)
+        atom.SetIsAromatic(False)
+        atom.SetNoImplicit(True)
+        atom.SetNumExplicitHs(0)
+        atom.SetNumRadicalElectrons(0)
+    rw.UpdatePropertyCache(strict=False)
+    return Chem.MolToSmiles(rw, isomericSmiles=False)
+
+
+@pytest.mark.skipif(find_spec("xyzgraph") is None, reason="needs rxembed[workflow]")
+@pytest.mark.parametrize(
+    ("xyz", "charge", "smiles"),
+    [
+        (_CARBOCATION_ZWITTERION, 0, "CC1[CH+]C(=O)Nc2cc([O-])ccc21"),
+        (_NO2_DOUBLET, 0, "[O]N=O"),
+        (_HYDROXIDE, -1, "[OH-]"),
+        (_SHORT_WATER_DIMER, 0, "O.O"),
+    ],
+    ids=["carbocation_zwitterion", "no2_doublet", "hydroxide", "short_water_dimer"],
+)
+def test_connectivity_read_has_the_bonds_of_its_smiles_without_placing_charges(tmp_path, xyz, charge, smiles):
+    """A zwitterion, a radical and an ion read with no charge placed; a hydrogen bond stays out."""
+    path = tmp_path / "geometry.xyz"
+    path.write_text(xyz)
+
+    mol = perceive.read_xyz(str(path), charge, bond_orders=None)
+
+    assert _bond_graph(mol) == _bond_graph(Chem.AddHs(Chem.MolFromSmiles(smiles)))
 
 
 def test_rdkit_connectivity_uses_native_bond_orders_for_an_organic_graph(caplog):

@@ -51,7 +51,7 @@ def correspondence_budgets(molecules, terms, correspondence, params):
     return dict(zip(correspondence, map(float, budgets), strict=True))
 
 
-def seed_paired_conformers(mol, cons, endpoints, n, params, *, max_iters, reseed=True):
+def seed_paired_conformers(mol, cons, endpoints, n, params, *, max_iters):
     """Seed one endpoint and transfer its mapped geometry before native endpoint relaxation."""
     # Break bond-count ties with fewer DG centroid helpers; an intact side-on ligand can be harder to seed.
     side = max(range(2), key=lambda index: (endpoints[index]._mol.GetNumBonds(), -len(endpoints[index].cons.haptic)))
@@ -62,16 +62,16 @@ def seed_paired_conformers(mol, cons, endpoints, n, params, *, max_iters, reseed
     mol.RemoveAllConformers()
     ids = []
     last_failure = None
-    for attempt in range(_REPLACEMENT_ROUNDS + 1 if reseed else 1):
+    for attempt in range(_REPLACEMENT_ROUNDS + 1):
         trial = replace(params, seed=params.seed + attempt)
         try:
             source, seeded_ids, _target = seed_conformers(
-                Chem.Mol(owner._mol), owner.cons, owner.iso, n - len(ids), trial, reseed=reseed
+                Chem.Mol(owner._mol), owner.cons, owner.iso, n - len(ids), trial
             )
             if not seeded_ids:
                 logger.info("coembed: seed %d produced no shared seeds", trial.seed)
                 continue
-            source = Conformers(source, seeded_ids, owner.cons, owner.iso, params=trial, _reseed=reseed)
+            source = Conformers(source, seeded_ids, owner.cons, owner.iso, params=trial)
             source.minimize(max_iters=max_iters)
             partner = Chem.Mol(other._mol)
             partner.RemoveAllConformers()
@@ -85,9 +85,7 @@ def seed_paired_conformers(mol, cons, endpoints, n, params, *, max_iters, reseed
                 conf.SetPositions(copied)
                 partner.AddConformer(conf, assignId=False)
             # Repair changed hybridisation before seed-centred conjugation holds capture the copied coordinates.
-            partner = Conformers(
-                partner, list(source.ids), other.cons.copy(conjugation=False), other.iso, params=trial, _reseed=reseed
-            )
+            partner = Conformers(partner, list(source.ids), other.cons.copy(conjugation=False), other.iso, params=trial)
             if axis_stereo(partner._stated_stereo):
                 split = endpoints[0]._mol.GetNumAtoms() + len(endpoints[0].cons.phantoms)
                 stationary = {pair[1 - side] - (split if side == 0 else 0) for pair in cons.alignment_pairs or ()}
@@ -189,7 +187,6 @@ class PairedConformers(Conformers):
             count,
             params,
             max_iters=self._seed_max_iters,
-            reseed=self._reseed,
         )
         endpoints = tuple(
             replace(
@@ -201,7 +198,6 @@ class PairedConformers(Conformers):
                 relax_failures={},
                 uff=UFFRecord(),
                 params=params,
-                _reseed=self._reseed,
             )
             for owner in self.endpoints
         )
@@ -210,7 +206,6 @@ class PairedConformers(Conformers):
             ids,
             self.cons,
             params=params,
-            _reseed=self._reseed,
             endpoints=endpoints,
             validators=tuple(
                 check.__func__.__get__(fresh, type(fresh)) if getattr(check, "__self__", None) is owner else check

@@ -564,7 +564,7 @@ def test_coembed_defaults_match_the_selected_proton_transfer_weights():
 
 @pytest.mark.parametrize("failure", ["empty", "relax"])
 @pytest.mark.parametrize("sampling", ["automatic", "seed", "params"])
-def test_coembed_retries_failed_ethanol_seeds_only_when_sampling_is_automatic(monkeypatch, failure, sampling):
+def test_coembed_retries_a_failed_ethanol_seed_from_the_given_seed(monkeypatch, failure, sampling):
     paired = importlib.import_module("rxembed.coembedding")
     native_seed = paired.seed_conformers
     native_minimize = paired.Conformers.minimize
@@ -593,15 +593,12 @@ def test_coembed_retries_failed_ethanol_seeds_only_when_sampling_is_automatic(mo
     elif sampling == "params":
         settings = {"params": rx.EmbedParams(seed=42, threads=1)}
 
-    if sampling == "automatic":
-        result = rx.coembed("CCO", "CCO", n=1, **settings)
-        assert len(result) == 1
-        assert seen == [seen[0], seen[0] + 1]
-        assert set(result.source_seeds.values()) == {seen[-1]}
-    else:
-        with pytest.raises(rx.EmbeddingError):
-            rx.coembed("CCO", "CCO", n=1, **settings)
-        assert seen == [42]
+    result = rx.coembed("CCO", "CCO", n=1, **settings)
+
+    assert seen == [seen[0], seen[0] + 1]
+    assert sampling == "automatic" or seen[0] == 42
+    assert len(result) == 1
+    assert set(result.source_seeds.values()) == {seen[-1]}
 
 
 def test_coembed_retains_ethanol_pairs_when_only_missing_seeds_are_retried(monkeypatch):
@@ -642,7 +639,7 @@ def test_coembed_reports_the_last_ethanol_failure_after_automatic_seed_retries(m
 
 
 @pytest.mark.parametrize("stereo_selection", [False, True])
-def test_coembed_keeps_the_explicit_seed_in_nested_geometry_recovery(monkeypatch, stereo_selection):
+def test_coembed_derives_every_nested_retry_from_the_explicit_seed(monkeypatch, stereo_selection):
     core = importlib.import_module("rxembed.embed")
     native = core.seed_coordinates
     seeds = []
@@ -663,13 +660,16 @@ def test_coembed_keeps_the_explicit_seed_in_nested_geometry_recovery(monkeypatch
             lambda *args, **kwargs: core.Failure("bonding", "ethanol seed failed bond validation"),
         )
 
-    with pytest.raises(rx.EmbeddingError):
-        rx.coembed(source, source, n=1, seed=42, threads=1)
+    runs = []
+    for _ in range(2):
+        seeds.clear()
+        with pytest.raises(rx.EmbeddingError):
+            rx.coembed(source, source, n=1, seed=42, threads=1)
+        runs.append(list(seeds))
 
-    assert seeds
-    assert set(seeds) == {42}
-    if not stereo_selection:
-        assert len(seeds) >= 2  # same-seed replacement remains available to repair copied geometry
+    assert runs[0] == runs[1]  # the explicit seed reproduces the whole search
+    assert runs[0][0] == 42
+    assert len(set(runs[0])) > 1  # its retries draw seeds of their own
 
 
 @pytest.mark.parametrize("reverse_product", [False, True])

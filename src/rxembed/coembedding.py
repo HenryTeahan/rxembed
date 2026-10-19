@@ -18,12 +18,11 @@ from .embed import (
     Conformers,
     EmbeddingError,
     _high_force_candidate,
-    _stable_coordination_failure,
     seed_conformers,
 )
 from .metal_core import materialise_phantoms
 from .relax import MAX_ITERS, UFFRecord, _alignment_terms, _coupled_uff, _prepare_uff, error_summary
-from .stereo import axis_stereo, rotate_axial_stereo
+from .stereo import invert_copied_stereo
 
 logger = logging.getLogger("rxembed")
 
@@ -86,21 +85,22 @@ def seed_paired_conformers(mol, cons, endpoints, n, params, *, max_iters):
                 partner.AddConformer(conf, assignId=False)
             # Repair changed hybridisation before seed-centred conjugation holds capture the copied coordinates.
             partner = Conformers(partner, list(source.ids), other.cons.copy(conjugation=False), other.iso, params=trial)
-            if axis_stereo(partner._stated_stereo):
+            if partner._stated_stereo:
                 split = endpoints[0]._mol.GetNumAtoms() + len(endpoints[0].cons.phantoms)
                 stationary = {pair[1 - side] - (split if side == 0 else 0) for pair in cons.alignment_pairs or ()}
+                twins = {pair[1 - side]: pair[side] for pair in cons.seed_correspondence}
+                seed_graph = source.restored_mol(source.ids[0])
                 for cid in partner.ids:
                     public = partner.restored_mol(cid)
-                    rotate_axial_stereo(public, partner._stated_stereo, stationary)
+                    invert_copied_stereo(public, partner._stated_stereo, stationary, seed_graph, twins)
                     partner._mol.GetConformer(cid).SetPositions(public.GetConformer().GetPositions())
-            typed = partner._relax_once(BASE_STIFFNESS, max_iters)
+            partner._relax_once(BASE_STIFFNESS, max_iters)
+            # A failed copy needs a new shared seed; embedding its endpoint alone would break the pair.
             failures = partner._acceptance_failures()
-            discarded = {
-                cid for reason, cids in failures.items() if _stable_coordination_failure(reason) for cid in cids
-            }
-            # A wrong coordination basin needs a different shared seed, not independent endpoint embedding.
-            partner._remove(discarded)
-            partner._accept_relaxed(BASE_STIFFNESS, max_iters, typed=typed)
+            partner._remove({cid for cids in failures.values() for cid in cids})
+            details = "; ".join(map(str, failures))
+            message = f"coembed: no copied {('reactant', 'product')[1 - side]} passed ({details}); try another seed="
+            last_failure = EmbeddingError(message) if failures else last_failure
             for cid in (cid for cid in source.ids if cid in partner.ids):
                 blocks = [
                     np.zeros((endpoint._mol.GetNumAtoms() + len(endpoint.cons.phantoms), 3)) for endpoint in endpoints
@@ -333,9 +333,6 @@ class PairedConformers(Conformers):
         self._seed_max_iters = max_iters
         self._sync_endpoints()
         self.joint_results, self.optimizer_attempts, self.recovery_batches = {}, [], []
-        failed = {cid for cids in self._acceptance_failures(operation).values() for cid in cids}
-        # Initial coupling can cross a declared stereo barrier too; retain valid inputs as well as cleanup.
-        checkpoint = {cid: self._mol.GetConformer(cid).GetPositions().copy() for cid in self.ids if cid not in failed}
         self._joint_pass(stiffness, max_iters, "initial")
         typed = True
         self.relax_failures = {}
@@ -349,28 +346,13 @@ class PairedConformers(Conformers):
             offset += owner._mol.GetNumAtoms() + len(owner.cons.phantoms)
         self._pack_endpoints()
         if typed:
-            failed = {cid for cids in self._acceptance_failures(operation).values() for cid in cids}
-            checkpoint.update(
-                (cid, self._mol.GetConformer(cid).GetPositions().copy()) for cid in self.ids if cid not in failed
-            )
             pending = list(self.ids)
             for multiplier in FC_ESCALATION:
                 self._joint_pass(stiffness * multiplier, max_iters, "polish", ids=pending)
                 failures = self._acceptance_failures(operation)
-                failed = {cid for cids in failures.values() for cid in cids}
-                checkpoint.update(
-                    (cid, self._mol.GetConformer(cid).GetPositions().copy()) for cid in self.ids if cid not in failed
-                )
                 pending = [cid for reason, cids in failures.items() if _high_force_candidate(reason) for cid in cids]
                 if not pending:
                     break
-            restored = failed & checkpoint.keys()
-            # Optional polishing must not turn a validated cleanup into a costly fresh-seed search.
-            for cid in restored:
-                self._mol.GetConformer(cid).SetPositions(checkpoint[cid])
-            self._sync_endpoints()
-            self._refresh_scores(stiffness)
-            self._mark_validation_adjusted(restored, "coupled relaxation rejected; retained last validated geometry")
         return typed
 
     def _acceptance_failures(self, operation="coembed", validator=None, ids=None):

@@ -812,9 +812,7 @@ def coembed(
     own haptic helpers. Drop wrong copied coordination shapes or donor seatings; bounded shared-seed retries
     refill only missing pairs. Initial and replacement batches use this same native endpoint workflow. With
     ``n=None``, use the larger endpoint's normal sampling target, counting each endpoint once.
-    Omit ``seed`` and ``params`` to try fresh seeds after failures. An explicit ``seed`` or supplied
-    ``EmbedParams`` keeps its RNG seed fixed, including stereo selection and replacement batches;
-    same-seed resampling remains available to repair copied endpoint geometry.
+    Retries derive their seeds from ``seed``, so an explicit seed reproduces the whole run.
 
     Derive TS-pair budgets from each atom's largest incompatible endpoint distance-window gap, with no
     added floor. Spectator pairs use zero budget. These are soft penalty thresholds and do not establish 3D
@@ -861,7 +859,6 @@ def coembed(
         ):
             raise ValueError(f"{name} must be finite and {'nonnegative' if nonnegative else 'positive'}")
     reactant, product = _coembed_inputs(reactant, product)
-    reseed = seed is None and params is None
     params = resolve_params(params, seed, threads)
     originals = [
         _coembed_endpoint(source, stereo, params, metal=metal, charge=charge) for source in (reactant, product)
@@ -906,7 +903,6 @@ def coembed(
                 joint_gtol=joint_gtol,
                 joint_energy_tol=joint_energy_tol,
                 max_iters=max_iters,
-                reseed=reseed,
             )
         except (ValueError, RuntimeError) as error:
             if label is None:
@@ -937,7 +933,6 @@ def _coembed_pair(
     joint_gtol,
     joint_energy_tol,
     max_iters,
-    reseed,
 ):
     """Seed, optimize and publish one endpoint pair through the shared bounded recovery engine."""
     allowances = correspondence_budgets(
@@ -961,9 +956,7 @@ def _coembed_pair(
     )
     if n is None:
         n = max(seed_count(owner._mol, constrained=owner.cons.is_constrained) for owner in owners)
-    for owner in owners:
-        owner._reseed = reseed
-    joint, ids = seed_paired_conformers(joint, cons, owners, n, params, max_iters=max_iters, reseed=reseed)
+    joint, ids = seed_paired_conformers(joint, cons, owners, n, params, max_iters=max_iters)
     if not ids:
         raise EmbeddingError("coembed: no shared seeds; inspect endpoint bounds/stereo or try another seed=")
     engine = PairedConformers(
@@ -971,7 +964,6 @@ def _coembed_pair(
         list(ids),
         cons,
         params=params,
-        _reseed=reseed,
         endpoints=tuple(owners),
         _seed_max_iters=max_iters,
         validators=tuple(owner._workflow_failure for owner in owners),

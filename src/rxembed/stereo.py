@@ -15,7 +15,7 @@ from rdkit.Chem.EnumerateStereoisomers import (
 )
 from rdkit.Geometry import Point3D
 
-from .metal_core import haptic_sites, ligand_graph, torsion_path
+from .metal_core import haptic_sites, ligand_graph, metal_indices, torsion_path
 from .utils import (
     DISCONNECTED,
     bond_removal_mirrors,
@@ -668,31 +668,76 @@ def _apply_atrop_stereo(mol, axes):
             raise ValueError(f"could not apply {target} atropisomer stereo on bond {pair}")
 
 
-def rotate_axial_stereo(mol, label, stationary):
-    """Rotate a copied conformer's mismatched axial hands while retaining its stationary scaffold."""
-    wanted = axis_stereo(label)
-    if not wanted:
-        return
+def invert_copied_stereo(mol, label, stationary, seed, twins):
+    """Apply a copied conformer's stated configuration changes, keeping its stationary scaffold in place.
+
+    Only elements whose atoms keep their bonds to their `twins` in `seed` change; the reaction sets the others.
+    """
+    unchanged = {
+        atom
+        for atom, twin in twins.items()
+        if {twins.get(n.GetIdx()) for n in mol.GetAtomWithIdx(atom).GetNeighbors()}
+        == {n.GetIdx() for n in seed.GetAtomWithIdx(twin).GetNeighbors()}
+    }
+    realised = stereo_from_3d(mol, exclude=metal_indices(mol))
     conf = mol.GetConformer()
-    for axis, target in wanted.items():
-        realised = axis_stereo(stereo_from_3d(mol)).get(axis)
-        if realised is None or realised == target:
+    for reader, turn in ((axis_stereo, lambda phi: -phi), (bond_stereo, lambda phi: phi + 180.0)):
+        for pair, code in reader(label).items():
+            if reader(realised).get(pair) in (None, code) or not set(pair) <= unchanged:
+                continue
+            moving = turning_side(mol, pair, stationary)
+            if moving is None:
+                continue  # a ring bond cannot turn
+            left, right = sorted(pair, key=lambda atom: atom in moving)  # SetDihedralDeg moves the last atom's side
+            first = next(n.GetIdx() for n in mol.GetAtomWithIdx(left).GetNeighbors() if n.GetIdx() != right)
+            last = next(n.GetIdx() for n in mol.GetAtomWithIdx(right).GetNeighbors() if n.GetIdx() != left)
+            quartet = first, left, right, last
+            rdMolTransforms.SetDihedralDeg(conf, *quartet, turn(rdMolTransforms.GetDihedralDeg(conf, *quartet)))
+    for centre, code in point_stereo(label).items():
+        if centre not in unchanged or point_stereo(realised).get(centre) in (None, code):
             continue
-        left, right = sorted(axis)
-        cut = Chem.RWMol(mol)
-        cut.RemoveBond(left, right)
-        fragments = Chem.GetMolFrags(cut)
-        sides = [set(next(part for part in fragments if atom in part)) for atom in (left, right)]
-        if left in sides[1]:
-            continue  # A cyclic axis has no independently rotatable side; leave it to native recovery.
-        if len(sides[1] & stationary) > len(sides[0] & stationary):
-            left, right = right, left
-        first = next(atom.GetIdx() for atom in mol.GetAtomWithIdx(left).GetNeighbors() if atom.GetIdx() != right)
-        last = next(atom.GetIdx() for atom in mol.GetAtomWithIdx(right).GetNeighbors() if atom.GetIdx() != left)
-        quartet = first, left, right, last
-        # Reflect the torsion, not the molecule: rotate one connected group without changing its local stereo.
-        phi = rdMolTransforms.GetDihedralDeg(conf, *quartet)
-        rdMolTransforms.SetDihedralDeg(conf, *quartet, -phi)
+        moving, plane = centre_inversion(mol, centre, stationary)
+        if plane is None:
+            continue  # no acyclic branch to carry
+        pos = conf.GetPositions()
+        normal = np.cross(pos[plane[1]] - pos[plane[0]], pos[plane[2]] - pos[plane[0]])
+        normal /= np.linalg.norm(normal)
+        for atom in moving:
+            conf.SetAtomPosition(atom, Point3D(*(pos[atom] - 2.0 * np.dot(pos[atom] - pos[plane[0]], normal) * normal)))
+
+
+def turning_side(mol, pair, stationary):
+    """Return the atoms on the side of bond `pair` that turn about it, or None when the bond is in a ring."""
+    first, second = pair
+    cut = Chem.RWMol(mol)
+    cut.RemoveBond(first, second)
+    fragments = Chem.GetMolFrags(cut)
+    sides = [set(next(part for part in fragments if atom in part)) for atom in (first, second)]
+    if first in sides[1]:
+        return None
+    return min(sides, key=lambda side: _moving_cost(mol, side, stationary))
+
+
+def centre_inversion(mol, centre, stationary):
+    """Return the atoms that invert `centre` and the three neighbours whose plane they reflect through, or None."""
+    neighbours = [atom.GetIdx() for atom in mol.GetAtomWithIdx(centre).GetNeighbors()]
+    if len(neighbours) == 3:  # noqa: PLR2004 - a lone pair is the fourth, massless substituent
+        return {centre}, neighbours
+    cut = Chem.RWMol(mol)
+    cut.RemoveAtom(centre)  # later indices shift down by one
+    fragments = [{i + (i >= centre) for i in part} for part in Chem.GetMolFrags(cut)]
+    branches = {n: next(part for part in fragments if n in part) for n in neighbours}
+    acyclic = [n for n in neighbours if not (set(neighbours) - {n}) & branches[n]]
+    if not acyclic:
+        return {centre}, None
+    carried = min(acyclic, key=lambda n: _moving_cost(mol, branches[n], stationary))
+    return {centre} | branches[carried], [n for n in neighbours if n != carried]
+
+
+def _moving_cost(mol, atoms, stationary):
+    """Rank a group that could move: fewest stationary atoms, then fewest heavy atoms, then fewest atoms."""
+    heavy = sum(mol.GetAtomWithIdx(atom).GetAtomicNum() != 1 for atom in atoms)
+    return len(atoms & stationary), heavy, len(atoms), min(atoms)
 
 
 def clear_ez(mol, pairs=None):

@@ -56,9 +56,11 @@ from rxembed.relax import MAX_ITERS
 from rxembed.stereo import (
     axis_stereo,
     bond_stereo,
+    centre_inversion,
     defined_stereo_label,
     enumerate_unassigned,
     point_stereo,
+    turning_side,
     unassigned_centres,
 )
 from rxembed.utils import reaction_correspondence
@@ -583,48 +585,34 @@ def _coembed_pairs(molecules, selection, name):
     return pairs
 
 
-def _atrop_rotating_atoms(molecules, *, alignment):
-    """Return mapped moving groups for changes between declared axial hands."""
-    axes = [
-        {
-            tuple(sorted(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in axis)): code
-            for axis, code in axis_stereo(defined_stereo_label(mol)).items()
-        }
-        for mol in molecules
-    ]
-    heavy_labels = {atom.GetAtomMapNum() for atom in molecules[0].GetAtoms() if atom.GetAtomicNum() != 1}
+def _configuration_moving_atoms(molecules, *, alignment):
+    """Return mapped atoms the copy moves for stated axes, double bonds and centres that change only configuration."""
+    labels = [defined_stereo_label(mol) for mol in molecules]
+    indices = [{atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()} for mol in molecules]
     moving = set()
-    for axis in axes[0].keys() & axes[1].keys():
-        if axes[0][axis] == axes[1][axis]:
-            continue
-        sides = [set(), set()]
-        for mol in molecules:
-            indices = {atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()}
-            cut = Chem.RWMol(mol)
-            cut.RemoveBond(*(indices[label] for label in axis))
-            fragments = Chem.GetMolFrags(cut)
-            for side, label in enumerate(axis):
-                fragment = next(part for part in fragments if indices[label] in part)
-                sides[side].update(mol.GetAtomWithIdx(index).GetAtomMapNum() for index in fragment)
-        if set(axis) <= sides[0] or set(axis) <= sides[1]:
-            if alignment is None:
-                raise ValueError(
-                    "an atropisomeric axis lies in a cycle; select stationary atoms with spectator_atoms= "
-                    "and moving atoms with ts_atoms="
-                )
-            continue
-        # Rotating an axis moves its whole attached group. Keep the larger scaffold as the reference frame;
-        # use both endpoints' fragments so a substituent cannot remain a strongly coupled spectator.
-        rotating = min(
-            sides,
-            key=lambda labels: (
-                len(labels & (alignment or set())),
-                len(labels & heavy_labels),
-                len(labels),
-                tuple(sorted(labels)),
-            ),
-        )
-        moving.update(rotating)
+
+    def numbered(mol, key):  # a centre is keyed by one atom, a bond or axis by two
+        return tuple(sorted(mol.GetAtomWithIdx(i).GetAtomMapNum() for i in ((key,) if isinstance(key, int) else key)))
+
+    for reader in (axis_stereo, bond_stereo, point_stereo):
+        codes = [
+            {numbered(mol, key): code for key, code in reader(text).items()}
+            for mol, text in zip(molecules, labels, strict=True)
+        ]
+        for key in codes[0].keys() & codes[1].keys():
+            ends = [[indices_[number] for number in key] for indices_ in indices]
+            reset = any(
+                _mapped_neighborhood(molecules[0].GetAtomWithIdx(i))
+                != _mapped_neighborhood(molecules[1].GetAtomWithIdx(j))
+                for i, j in zip(*ends, strict=True)
+            )
+            if codes[0][key] == codes[1][key] or reset:
+                continue  # unchanged, or set by a bond change
+            # The copy moves these atoms (`invert_copied_stereo`), so they cannot stay coupled spectators.
+            for mol, indices_, atoms in zip(molecules, indices, ends, strict=True):
+                held = {indices_[number] for number in alignment or () if number in indices_}
+                group = centre_inversion(mol, atoms[0], held)[0] if len(atoms) == 1 else turning_side(mol, atoms, held)
+                moving.update(mol.GetAtomWithIdx(i).GetAtomMapNum() for i in group or ())
     return moving
 
 
@@ -681,7 +669,7 @@ def _coembed_correspondence(molecules, spectator_atoms, ts_atoms, *, frames=Fals
         or stereo[0].get(label) != stereo[1].get(label)
     }
     alignment = None if selected is None else {graphs[0].GetAtomWithIdx(i).GetAtomMapNum() for i, _j in selected}
-    rotating = _atrop_rotating_atoms(graphs, alignment=alignment)
+    rotating = _configuration_moving_atoms(graphs, alignment=alignment)
     changed.update(pair for label, pair in enumerate(correspondence, 1) if label in rotating)
     if selected is None:
         unchanged = tuple(pair for pair in correspondence if pair not in changed)

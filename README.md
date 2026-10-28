@@ -219,7 +219,7 @@ center to move, retaining each endpoint's geometry and stereochemistry.
 ```python
 reactant = "[CH3:1][CH2:2][CH2:3][NH2:4].[OH:5][H:99]"
 product = "[CH3:1][CH2:2][CH2:3][NH2+:4]([H:99]).[OH-:5]"
-pairs = rx.coembed(reactant, product, n=4, seed=42)
+pairs = rx.coembed(reactant, product, n=4, seed=42, seed_relax_iters=50)
 reactant_mol, product_mol = pairs[0]
 print(pairs.alignment_scores)  # spectator-atom RMSD, Angstrom
 pairs.reactant.dump("reactant.xyz", align=False)
@@ -231,8 +231,28 @@ SMILES is also accepted. Both endpoints must contain the same atom inventory; at
 correspondence. `charge=` supplies the charge for XYZ inputs.
 
 `constrain=` and `contacts=` use reactant atom indices and apply to both endpoints where applicable.
-Start with `n=1` for large flexible molecules; fewer pairs than requested may survive validation. Preserve
-the shared frame with `align=False` when exporting and `auto_align=False` when visualizing with `xyzrender`.
+Use more than three conformers to reduce sensitivity to unfavorable starting geometries; `n<=3` warns.
+Fewer pairs than requested may survive validation. Preserve the shared frame with `align=False` when exporting and `auto_align=False` when visualizing with `xyzrender`.
+
+Coembedding seeds one numerical union graph. Changing bonds are ZERO, and native CPCI preferences attract
+changing edges and repel unbonded outer atoms connected by one forming and one breaking edge. Supplied native
+RDKit parameters retain their own CPCI settings. Shared distance windows average compatible endpoint bounds
+and retain their hull when disjoint. Original endpoint graphs remain authoritative: shared coordinates are
+copied to them, declared stereo receives native torsion restraints, and each endpoint gets guarded UFF
+preparation capped by `seed_relax_iters` per attempt (100 by default). Failed preparation restores the shared
+seed. One joint optimization pass then moves all atoms, with up to `joint_max_iters=100` native steps per
+endpoint per cycle and at most `max_cycles=100` cycles. `react_weight=1.25` weights reacting-atom squared
+distances; `alignment_weight=25` weights spectators. Every separation incurs a penalty, with no free movement
+allowance. Failed joint results retain a valid prepared pair when available.
+
+For seed comparisons, `seed_union=False` embeds all atoms on the endpoint graph with more bonds, then copies
+mapped coordinates to its partner. `seed_cpci=False` disables rxembed-generated CPCI preferences. The options
+are independent; caller-supplied native RDKit CPCI settings remain caller-owned. Missing or rejected union
+candidates retry from fresh endpoint seeds without generated CPCI. Successful pairs are retained, and a short
+ensemble is returned if recovery cannot fill every requested slot. `pair.joint_results[cid]["seed_bounds"]`
+records whether a pair came from `average` or `endpoint` seeding. Returned pairs and both endpoint `.mol`
+conformer lists are ordered by ascending combined score, with unscored or non-finite scores last. `pair[0]`
+selects the lowest-score pair.
 
 See [15_coembedding](examples/15_coembedding.ipynb) for worked examples and the algorithm.
 
